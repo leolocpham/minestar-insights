@@ -1,0 +1,7 @@
+streamlit>=1.35.0
+pandas>=2.1.0
+numpy>=1.26.0
+plotly>=5.18.0
+python-pptx>=0.6.21
+matplotlib>=3.8.0
+openpyxl>=3.1.0
