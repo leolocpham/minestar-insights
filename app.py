@@ -15,6 +15,10 @@ import streamlit as st
 from data_processor import (load_data, get_sheet_names, preview_sheets,
                              load_multiple_sheets, detect_columns,
                              run_all_analyses, COLUMN_PATTERNS)
+from db_connector import (build_conn_str, test_connection, get_tables,
+                           get_date_columns, preview_table, score_table,
+                           query_table, save_settings, load_settings,
+                           get_available_driver)
 from insights_engine import generate_all_insights
 from presentation_builder import build_presentation
 from sample_data import generate_sample_csv
@@ -387,21 +391,194 @@ def render_landing():
 
 
 # ---------------------------------------------------------------------------
+# SQL Server connection UI
+# ---------------------------------------------------------------------------
+
+def render_db_section() -> Optional[pd.DataFrame]:
+    """Direct SQL Server connection. Returns loaded DataFrame or None."""
+    saved = load_settings()
+
+    # ── Step 1: Connection form ───────────────────────────────────────────────
+    st.markdown("#### Step 1 — Connection Details")
+
+    c1, c2 = st.columns(2)
+    server   = c1.text_input("Server", value=saved.get("server", ""),
+                              placeholder=r"PVMINE-BACKUP\MINESTAR", key="db_server")
+    database = c2.text_input("Database", value=saved.get("database", ""),
+                              placeholder="MineStar_Prod", key="db_database")
+
+    auth_choice = st.radio(
+        "Authentication",
+        ["Windows Authentication (Trusted)", "SQL Server Login"],
+        index=0 if saved.get("use_windows_auth", True) else 1,
+        horizontal=True, key="db_auth",
+    )
+    use_windows = auth_choice.startswith("Windows")
+
+    username = password = ""
+    if not use_windows:
+        u1, u2 = st.columns(2)
+        username = u1.text_input("Username", value=saved.get("username", ""), key="db_user")
+        password = u2.text_input("Password", type="password", key="db_pass")
+
+    driver = get_available_driver()
+    if driver is None:
+        st.warning(
+            "No SQL Server ODBC driver detected on this machine. "
+            "Download **ODBC Driver 17 for SQL Server** from Microsoft, install it, "
+            "then restart this app."
+        )
+
+    if st.button("🔌 Test & Connect", type="primary", key="db_connect_btn"):
+        if not server or not database:
+            st.error("Enter both server and database name.")
+        else:
+            conn_str = build_conn_str(server, database, use_windows, username, password, driver)
+            with st.spinner("Connecting to SQL Server…"):
+                ok, msg = test_connection(conn_str)
+            if ok:
+                st.session_state["db_conn_str"]  = conn_str
+                st.session_state["db_connected"] = True
+                st.session_state.pop("db_df", None)   # clear any previous data
+                save_settings(server, database, use_windows, username)
+                st.success(f"✅ {msg}")
+                st.rerun()
+            else:
+                st.error(f"❌ Connection failed: {msg}")
+
+    if not st.session_state.get("db_connected"):
+        return None
+
+    conn_str = st.session_state["db_conn_str"]
+
+    # ── Step 2: Table browser ─────────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### Step 2 — Browse & Select Table")
+
+    if "db_tables" not in st.session_state:
+        with st.spinner("Loading table list…"):
+            st.session_state["db_tables"] = get_tables(conn_str)
+
+    all_tables = st.session_state["db_tables"]
+    if not all_tables:
+        st.warning("No tables found in this database. Check permissions.")
+        return None
+
+    search = st.text_input("🔍 Filter tables", placeholder="type to search…", key="db_search")
+    filtered = [t for t in all_tables if search.lower() in t.lower()] if search else all_tables
+
+    default_idx = 0
+    if saved.get("last_table") in filtered:
+        default_idx = filtered.index(saved["last_table"])
+
+    selected_table = st.selectbox(
+        f"Select table ({len(filtered)} shown)", filtered,
+        index=default_idx, key="db_table_select",
+    )
+
+    # Show table preview + detected data types
+    if selected_table:
+        with st.expander("Preview table (first 5 rows)", expanded=False):
+            try:
+                prev = preview_table(conn_str, selected_table, n=5)
+                st.dataframe(prev, use_container_width=True)
+                info = score_table(conn_str, selected_table)
+                if info["detected_types"]:
+                    st.caption(
+                        f"Detected MineStar data: {' · '.join(info['detected_types'])}  "
+                        f"| Estimated rows: {info['row_count']:,}"
+                    )
+                else:
+                    st.caption("No MineStar column patterns detected in this table.")
+            except Exception as e:
+                st.error(f"Could not preview: {e}")
+
+    # ── Step 3: Date range & row limit ────────────────────────────────────────
+    st.divider()
+    st.markdown("#### Step 3 — Date Range & Load")
+
+    date_cols = []
+    if selected_table:
+        try:
+            date_cols = get_date_columns(conn_str, selected_table)
+        except Exception:
+            pass
+
+    use_date_filter = st.toggle("Filter by date range", value=bool(date_cols), key="db_use_date")
+
+    date_col = start_dt = end_dt = None
+    if use_date_filter and date_cols:
+        dc1, dc2, dc3 = st.columns(3)
+        date_col = dc1.selectbox("Date column", date_cols, key="db_date_col")
+        start_dt = dc2.date_input("From", value=pd.Timestamp.now() - pd.Timedelta(days=30),
+                                   key="db_start")
+        end_dt   = dc3.date_input("To",   value=pd.Timestamp.now(), key="db_end")
+    elif use_date_filter and not date_cols:
+        st.info("No date columns detected in this table.")
+
+    row_limit = st.select_slider(
+        "Max rows to load",
+        options=[1_000, 5_000, 10_000, 25_000, 50_000, 100_000],
+        value=25_000, key="db_row_limit",
+    )
+
+    if st.button("⬇️ Load Data from Database", type="primary", key="db_load_btn"):
+        with st.spinner(f"Querying {selected_table}…"):
+            try:
+                df = query_table(
+                    conn_str, selected_table,
+                    date_col=date_col if use_date_filter else None,
+                    start_date=start_dt, end_date=end_dt,
+                    limit=row_limit,
+                )
+                df.columns = df.columns.str.strip()
+                st.session_state["db_df"] = df
+                save_settings(
+                    st.session_state.get("db_server", ""),
+                    st.session_state.get("db_database", ""),
+                    use_windows, username, last_table=selected_table,
+                )
+                st.success(f"Loaded **{len(df):,} rows** from `{selected_table}`.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Query failed: {e}")
+
+    return st.session_state.get("db_df")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
     st.title("⛏️ MineStar Operations Insights")
-    st.caption("Upload a MineStar export to generate automated analysis and a PowerPoint report.")
+    st.caption("Connect to your MineStar SQL Server or upload an exported file.")
 
-    uploaded = st.file_uploader(
-        "Upload MineStar export (CSV or Excel)",
-        type=["csv", "xlsx", "xls"],
-        label_visibility="collapsed",
+    source = st.radio(
+        "Data source",
+        ["📁 Upload File (CSV / Excel / Power BI export)",
+         "🗄️ SQL Server — Direct Database Connection"],
+        horizontal=True, key="data_source",
     )
 
-    if uploaded is None:
-        render_landing()
-        return
+    df: Optional[pd.DataFrame] = None
+
+    # ── SQL Server path ───────────────────────────────────────────────────────
+    if source.startswith("🗄️"):
+        df = render_db_section()
+        if df is None:
+            return
+
+    # ── File upload path ──────────────────────────────────────────────────────
+    else:
+        uploaded = st.file_uploader(
+            "Upload MineStar export (CSV or Excel)",
+            type=["csv", "xlsx", "xls"],
+            label_visibility="collapsed",
+        )
+
+        if uploaded is None:
+            render_landing()
+            return
 
     # ── Multi-sheet selector for Excel / Power BI exports ────────────────────
     sheet_names = get_sheet_names(uploaded)
@@ -487,6 +664,7 @@ def main():
         except ValueError as e:
             st.error(str(e))
             return
+    # ── end of data source section — df is now populated either way ──────────
 
     col_map_detected = detect_columns(df)
     n_detected = len(col_map_detected)
