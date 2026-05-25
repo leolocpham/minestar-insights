@@ -14,27 +14,32 @@ logger = logging.getLogger(__name__)
 # Column detection patterns (keyword → standardised field name)
 # ---------------------------------------------------------------------------
 COLUMN_PATTERNS = {
-    "machine":          ["machine", "truck", "equipment id", "asset", "unit id", "vehicle"],
-    "operator":         ["operator", "driver", "personnel"],
-    "date":             ["date", "shift date", "activity date"],
-    "shift":            ["shift"],
-    "total_cycle_time": ["total cycle", "cycle time", "total time (min"],
-    "queue_time":       ["queue time", "waiting time", "wait time"],
-    "load_time":        ["load time", "loading time", "load duration"],
-    "travel_loaded":    ["travel loaded", "haul time", "loaded travel", "travel full"],
+    # PVM-specific exact names listed first; generic fallbacks follow
+    "machine":          ["primary machine name", "machine name", "machine", "truck", "equipment id", "asset", "unit id", "vehicle"],
+    "operator":         ["primary operator", "operator", "driver", "personnel"],
+    "date":             ["shift date", "date", "activity date"],
+    "shift":            ["name", "shift name", "shift"],          # PVM "Name" = "Day"/"Night"
+    "cycle_type":       ["cycle type"],
+    "total_cycle_time": ["cycle time", "ct", "total cycle", "total time (min"],
+    "queue_time":       ["queue & wait source", "queue source", "queue time", "waiting time", "wait time"],
+    "queue_sink":       ["queue & wait sink", "queue sink"],       # PVM: queue at crusher
+    "load_time":        ["loading", "load time", "loading time", "load duration"],
+    "travel_loaded":    ["travel full", "travel loaded", "haul time", "loaded travel"],
     "travel_empty":     ["travel empty", "return time", "empty travel", "travel return"],
-    "dump_time":        ["dump time", "dumping time", "dump duration"],
-    "spot_time":        ["spot time", "spotting"],
-    "payload":          ["payload (t", "gross payload", "net payload", "load weight", "payload t"],
-    "target_payload":   ["target payload", "nominal payload", "rated payload", "design payload"],
-    "load_location":    ["load location", "shovel", "excavator", "load site", "source"],
-    "dump_location":    ["dump location", "dump site", "destination", "crusher", "waste dump"],
-    "operating_hours":  ["operating hours", "productive hours", "working hours", "engine hours"],
-    "idle_hours":       ["idle hours", "standby hours", "idle time"],
-    "down_hours":       ["down hours", "downtime hours", "maintenance hours", "repair hours"],
-    "scheduled_hours":  ["scheduled hours", "available hours", "total hours", "calendar hours"],
+    "dump_time":        ["dumping", "dump time", "dumping time", "dump duration"],
+    "spot_time":        ["spot source", "spot sink", "spot time", "spotting"],
+    "payload":          ["payload", "gross payload", "net payload", "load weight"],
+    "payload_dmt":      ["paylod (dmt)", "payload (dmt)", "dry metric tonne"],  # PVM typo "paylod"
+    "target_payload":   ["nominal payload", "target payload", "rated payload", "design payload"],
+    "load_location":    ["source", "load location", "load site", "excavator"],
+    "dump_location":    ["sink", "dump location", "dump site", "destination"],
+    "operating_hours":  ["total operating hrs", "operating hours", "productive hours", "working hours"],
+    "idle_hours":       ["total delay hrs", "idle hours", "standby hours", "idle time"],
+    "down_hours":       ["total down hrs", "down hours", "downtime hours", "maintenance hours"],
+    "scheduled_hours":  ["total hrs", "scheduled hours", "available hours", "calendar hours"],
     "availability_pct": ["physical availability", "mechanical availability", "availability %", "avail %"],
     "utilization_pct":  ["use of availability", "utilization %", "utilisation %", "util %"],
+    "crew":             ["crew"],
 }
 
 
@@ -42,14 +47,31 @@ def detect_columns(df: pd.DataFrame) -> dict:
     col_map: dict = {}
     cols_lower = {c.lower().strip(): c for c in df.columns}
     for field, patterns in COLUMN_PATTERNS.items():
+        # Pass 1: exact case-insensitive match (handles short names: CT, Payload, Source, Sink…)
+        for pattern in patterns:
+            if pattern.lower() in cols_lower:
+                col_map[field] = cols_lower[pattern.lower()]
+                break
+        if field in col_map:
+            continue
+        # Pass 2: substring match fallback
         for pattern in patterns:
             for col_lower, col_orig in cols_lower.items():
-                if pattern in col_lower:
+                if pattern.lower() in col_lower:
                     col_map[field] = col_orig
                     break
             if field in col_map:
                 break
     return col_map
+
+
+def filter_by_cycle_type(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
+    """Keep only TruckCycle and LoaderCycle rows when a Cycle Type column is present."""
+    ct_col = col_map.get("cycle_type")
+    if ct_col and ct_col in df.columns:
+        mask = df[ct_col].isin(["TruckCycle", "LoaderCycle"])
+        return df[mask].reset_index(drop=True)
+    return df
 
 
 def get_sheet_names(file) -> list[str]:
@@ -180,7 +202,7 @@ def analyze_cycle_times(df: pd.DataFrame, col_map: dict) -> dict:
     })
 
     bd: dict = {}
-    for key in ["queue_time", "load_time", "travel_loaded", "travel_empty", "dump_time", "spot_time"]:
+    for key in ["queue_time", "queue_sink", "load_time", "travel_loaded", "travel_empty", "dump_time", "spot_time"]:
         s = _col(d, col_map, key)
         if s is not None:
             bd[key] = _num(s).mean()
@@ -374,6 +396,18 @@ def analyze_operators(df: pd.DataFrame, col_map: dict) -> dict:
     if "Efficiency Score" in by_op.columns and len(by_op) >= 3:
         result["needs_coaching"] = by_op.nsmallest(3, "Efficiency Score")["Operator"].tolist()
 
+    # Crew-level breakdown (PVM "Crew" column)
+    crew_s = _col(d, col_map, "crew")
+    if crew_s is not None:
+        d["_cr"] = crew_s.astype(str)
+        crew_agg: dict = {"Cycles": ("_op", "count")}
+        if "_pl" in d.columns: crew_agg["Avg Payload (t)"] = ("_pl", "mean")
+        if "_ct" in d.columns: crew_agg["Avg Cycle (min)"] = ("_ct", "mean")
+        by_crew = (d.groupby("_cr").agg(**crew_agg).reset_index()
+                   .rename(columns={"_cr": "Crew"})
+                   .sort_values("Cycles", ascending=False))
+        result["by_crew"] = by_crew
+
     return result
 
 
@@ -381,10 +415,12 @@ def analyze_operators(df: pd.DataFrame, col_map: dict) -> dict:
 # Run all
 # ---------------------------------------------------------------------------
 def run_all_analyses(df: pd.DataFrame, col_map: dict) -> dict:
+    df_filtered = filter_by_cycle_type(df, col_map)
     return {
-        "cycle_times":  analyze_cycle_times(df, col_map),
-        "payload":      analyze_payload(df, col_map),
-        "utilization":  analyze_utilization(df, col_map),
-        "operators":    analyze_operators(df, col_map),
-        "row_count":    len(df),
+        "cycle_times":  analyze_cycle_times(df_filtered, col_map),
+        "payload":      analyze_payload(df_filtered, col_map),
+        "utilization":  analyze_utilization(df_filtered, col_map),
+        "operators":    analyze_operators(df_filtered, col_map),
+        "row_count":    len(df_filtered),
+        "raw_row_count": len(df),
     }

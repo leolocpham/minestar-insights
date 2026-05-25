@@ -72,7 +72,8 @@ def render_sidebar(df: pd.DataFrame, col_map: dict) -> dict:
         ("operator",         "Operator"),
         ("shift",            "Shift"),
         ("total_cycle_time", "Total Cycle Time (min)"),
-        ("queue_time",       "Queue Time (min)"),
+        ("queue_time",       "Queue Time — Shovel (min)"),
+        ("queue_sink",       "Queue Time — Crusher (min)"),
         ("load_time",        "Load Time (min)"),
         ("travel_loaded",    "Travel Loaded (min)"),
         ("travel_empty",     "Travel Empty (min)"),
@@ -157,9 +158,13 @@ def render_cycle_tab(ct: dict):
     bd = ct.get("time_breakdown", {})
     if bd:
         labels_map = {
-            "queue_time": "Queue", "load_time": "Load",
-            "travel_loaded": "Travel (Loaded)", "travel_empty": "Travel (Empty)",
-            "dump_time": "Dump", "spot_time": "Spot",
+            "queue_time":    "Queue (Shovel)",
+            "queue_sink":    "Queue (Crusher)",
+            "load_time":     "Load",
+            "travel_loaded": "Travel (Loaded)",
+            "travel_empty":  "Travel (Empty)",
+            "dump_time":     "Dump",
+            "spot_time":     "Spot",
         }
         labels = [labels_map.get(k, k) for k, v in bd.items() if v and v > 0]
         values = [v for v in bd.values() if v and v > 0]
@@ -356,6 +361,11 @@ def render_operator_tab(op: dict):
         disp = by_op.sort_values("Efficiency Score", ascending=False).reset_index(drop=True)
         disp.index += 1
         st.dataframe(disp.round(1), use_container_width=True, height=320)
+
+    by_crew = op.get("by_crew")
+    if by_crew is not None and len(by_crew) > 0:
+        st.markdown("#### Performance by Crew")
+        st.dataframe(by_crew.round(1), use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +681,8 @@ def main():
     st.success(
         f"Loaded **{len(df):,} rows × {len(df.columns)} columns**. "
         f"Auto-detected **{n_detected}** MineStar fields."
+        + (f"  ·  Filtering to TruckCycle/LoaderCycle rows only."
+           if col_map_detected.get("cycle_type") else "")
     )
 
     # Sidebar settings + column override
