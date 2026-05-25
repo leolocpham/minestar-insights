@@ -12,7 +12,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_processor import load_data, detect_columns, run_all_analyses, COLUMN_PATTERNS
+from data_processor import load_data, get_sheet_names, detect_columns, run_all_analyses, COLUMN_PATTERNS
 from insights_engine import generate_all_insights
 from presentation_builder import build_presentation
 from sample_data import generate_sample_csv
@@ -401,9 +401,43 @@ def main():
         render_landing()
         return
 
-    # Load & detect
+    # ── Sheet selector for multi-tab Excel / Power BI exports ────────────────
+    sheet_name = None
+    sheet_names = get_sheet_names(uploaded)
+    if sheet_names:
+        if len(sheet_names) == 1:
+            sheet_name = sheet_names[0]
+        else:
+            # Score each sheet by how many MineStar-like columns it contains
+            def _score_sheet(file, sname):
+                try:
+                    file.seek(0)
+                    preview = pd.read_excel(file, sheet_name=sname, nrows=3, thousands=",")
+                    cols_lower = " ".join(preview.columns.str.lower())
+                    keywords = ["machine", "truck", "operator", "cycle", "payload",
+                                "shift", "availability", "utilization", "hours"]
+                    return sum(kw in cols_lower for kw in keywords)
+                except Exception:
+                    return 0
+
+            scores = {s: _score_sheet(uploaded, s) for s in sheet_names}
+            best_sheet = max(scores, key=scores.get)
+
+            st.info(
+                f"**{len(sheet_names)} sheets found** in this file. "
+                f"The best match for MineStar data is highlighted below."
+            )
+            sheet_name = st.selectbox(
+                "Select the sheet containing your MineStar data:",
+                options=sheet_names,
+                index=sheet_names.index(best_sheet),
+                format_func=lambda s: f"{'★ ' if s == best_sheet else '  '}{s}",
+                key="sheet_selector",
+            )
+
+    # Load selected sheet
     try:
-        df = load_data(uploaded)
+        df = load_data(uploaded, sheet_name=sheet_name)
     except ValueError as e:
         st.error(str(e))
         return

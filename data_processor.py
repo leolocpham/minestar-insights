@@ -52,21 +52,39 @@ def detect_columns(df: pd.DataFrame) -> dict:
     return col_map
 
 
-def load_data(file) -> pd.DataFrame:
+def get_sheet_names(file) -> list[str]:
+    """Return sheet names for Excel files; empty list for CSV."""
     name = getattr(file, "name", "").lower()
-    for enc in ("utf-8", "utf-8-sig", "latin-1"):
-        try:
-            if name.endswith(".csv"):
-                file.seek(0)
-                df = pd.read_csv(file, encoding=enc, thousands=",")
-            else:
-                df = pd.read_excel(file, thousands=",")
+    if name.endswith(".csv"):
+        return []
+    try:
+        file.seek(0)
+        xf = pd.ExcelFile(file)
+        return xf.sheet_names
+    except Exception:
+        return []
+
+
+def load_data(file, sheet_name: str | None = None) -> pd.DataFrame:
+    """Load CSV or a specific Excel sheet into a DataFrame."""
+    name = getattr(file, "name", "").lower()
+    try:
+        if name.endswith(".csv"):
+            for enc in ("utf-8", "utf-8-sig", "latin-1"):
+                try:
+                    file.seek(0)
+                    df = pd.read_csv(file, encoding=enc, thousands=",")
+                    df.columns = df.columns.str.strip()
+                    return df
+                except UnicodeDecodeError:
+                    continue
+        else:
+            file.seek(0)
+            df = pd.read_excel(file, sheet_name=sheet_name, thousands=",")
             df.columns = df.columns.str.strip()
             return df
-        except UnicodeDecodeError:
-            continue
-        except Exception:
-            break
+    except Exception:
+        pass
     raise ValueError("Could not read file. Ensure it is a valid CSV or Excel export from MineStar.")
 
 
