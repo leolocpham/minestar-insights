@@ -12,7 +12,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_processor import load_data, get_sheet_names, detect_columns, run_all_analyses, COLUMN_PATTERNS
+from data_processor import (load_data, get_sheet_names, preview_sheets,
+                             load_multiple_sheets, detect_columns,
+                             run_all_analyses, COLUMN_PATTERNS)
 from insights_engine import generate_all_insights
 from presentation_builder import build_presentation
 from sample_data import generate_sample_csv
@@ -401,46 +403,90 @@ def main():
         render_landing()
         return
 
-    # ── Sheet selector for multi-tab Excel / Power BI exports ────────────────
-    sheet_name = None
+    # ── Multi-sheet selector for Excel / Power BI exports ────────────────────
     sheet_names = get_sheet_names(uploaded)
-    if sheet_names:
-        if len(sheet_names) == 1:
-            sheet_name = sheet_names[0]
-        else:
-            # Score each sheet by how many MineStar-like columns it contains
-            def _score_sheet(file, sname):
-                try:
-                    file.seek(0)
-                    preview = pd.read_excel(file, sheet_name=sname, nrows=3, thousands=",")
-                    cols_lower = " ".join(preview.columns.str.lower())
-                    keywords = ["machine", "truck", "operator", "cycle", "payload",
-                                "shift", "availability", "utilization", "hours"]
-                    return sum(kw in cols_lower for kw in keywords)
-                except Exception:
-                    return 0
 
-            scores = {s: _score_sheet(uploaded, s) for s in sheet_names}
-            best_sheet = max(scores, key=scores.get)
+    if not sheet_names:
+        # Plain CSV — load directly
+        try:
+            df = load_data(uploaded)
+        except ValueError as e:
+            st.error(str(e))
+            return
 
-            st.info(
-                f"**{len(sheet_names)} sheets found** in this file. "
-                f"The best match for MineStar data is highlighted below."
-            )
-            sheet_name = st.selectbox(
-                "Select the sheet containing your MineStar data:",
-                options=sheet_names,
-                index=sheet_names.index(best_sheet),
-                format_func=lambda s: f"{'★ ' if s == best_sheet else '  '}{s}",
-                key="sheet_selector",
-            )
+    elif len(sheet_names) == 1:
+        # Single-sheet Excel — load directly
+        try:
+            df = load_data(uploaded, sheet_name=sheet_names[0])
+        except ValueError as e:
+            st.error(str(e))
+            return
 
-    # Load selected sheet
-    try:
-        df = load_data(uploaded, sheet_name=sheet_name)
-    except ValueError as e:
-        st.error(str(e))
-        return
+    else:
+        # Multi-sheet Excel — show preview table and let user pick sheets
+        with st.spinner("Scanning sheets…"):
+            previews = preview_sheets(uploaded)
+
+        type_icons = {
+            "cycle_times": "🔄", "payload": "⚖️",
+            "utilization": "🔧", "operators": "👷",
+        }
+        type_labels = {
+            "cycle_times": "Cycle Times", "payload": "Payload",
+            "utilization": "Utilization",  "operators": "Operators",
+        }
+
+        st.markdown("### Select sheets to include in the report")
+        st.caption(
+            "The app detected which sheets contain MineStar data. "
+            "Tick the ones you want — they will be merged into one combined analysis."
+        )
+
+        # Build a preview table
+        preview_rows = []
+        for sname, info in previews.items():
+            types_str = "  ".join(
+                f"{type_icons[t]} {type_labels[t]}"
+                for t in info["detected_types"]
+            ) or "⚠️ No MineStar data detected"
+            preview_rows.append({
+                "Sheet": sname,
+                "Rows": f"{info['rows']:,}",
+                "Columns": info["cols"],
+                "Contains": types_str,
+            })
+
+        st.dataframe(pd.DataFrame(preview_rows), use_container_width=True,
+                     hide_index=True, height=min(200, 45 + len(preview_rows) * 38))
+
+        # Default: select sheets that have MineStar data
+        default_selected = [s for s, info in previews.items() if info["score"] > 0]
+        if not default_selected:
+            default_selected = sheet_names[:1]
+
+        selected_sheets = st.multiselect(
+            "Sheets to merge:",
+            options=sheet_names,
+            default=default_selected,
+            key="sheet_multiselect",
+        )
+
+        if not selected_sheets:
+            st.warning("Select at least one sheet to continue.")
+            st.stop()
+
+        # Load and merge
+        try:
+            with st.spinner(f"Loading {len(selected_sheets)} sheet(s)…"):
+                df = load_multiple_sheets(uploaded, selected_sheets)
+            if len(selected_sheets) > 1:
+                st.success(
+                    f"Merged **{len(selected_sheets)} sheets** → "
+                    f"**{len(df):,} rows** total."
+                )
+        except ValueError as e:
+            st.error(str(e))
+            return
 
     col_map_detected = detect_columns(df)
     n_detected = len(col_map_detected)

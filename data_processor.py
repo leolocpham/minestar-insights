@@ -65,6 +65,41 @@ def get_sheet_names(file) -> list[str]:
         return []
 
 
+def preview_sheets(file) -> dict:
+    """
+    Return a summary dict for every sheet:
+        {sheet_name: {rows, cols, detected_types, score}}
+    Used to show the user what each sheet contains before loading.
+    """
+    KEYWORDS = {
+        "cycle_times":  ["cycle", "queue", "travel", "haul"],
+        "payload":      ["payload", "load weight", "tonnes"],
+        "utilization":  ["availability", "utilization", "operating hours", "idle", "downtime"],
+        "operators":    ["operator", "driver"],
+    }
+    summaries = {}
+    sheet_names = get_sheet_names(file)
+    for sname in sheet_names:
+        try:
+            file.seek(0)
+            df = pd.read_excel(file, sheet_name=sname, nrows=5, thousands=",")
+            cols_lower = " ".join(df.columns.str.lower())
+            detected = [label for label, kws in KEYWORDS.items()
+                        if any(kw in cols_lower for kw in kws)]
+            file.seek(0)
+            full = pd.read_excel(file, sheet_name=sname, thousands=",")
+            summaries[sname] = {
+                "rows":           len(full),
+                "cols":           len(full.columns),
+                "detected_types": detected,
+                "score":          len(detected),
+                "df":             full,
+            }
+        except Exception:
+            summaries[sname] = {"rows": 0, "cols": 0, "detected_types": [], "score": 0, "df": pd.DataFrame()}
+    return summaries
+
+
 def load_data(file, sheet_name: str | None = None) -> pd.DataFrame:
     """Load CSV or a specific Excel sheet into a DataFrame."""
     name = getattr(file, "name", "").lower()
@@ -86,6 +121,28 @@ def load_data(file, sheet_name: str | None = None) -> pd.DataFrame:
     except Exception:
         pass
     raise ValueError("Could not read file. Ensure it is a valid CSV or Excel export from MineStar.")
+
+
+def load_multiple_sheets(file, sheet_names: list[str]) -> pd.DataFrame:
+    """
+    Load and concatenate multiple sheets into one DataFrame.
+    Adds a '_source_sheet' column so you can trace which row came from where.
+    Columns that don't exist in a sheet are filled with NaN.
+    """
+    frames = []
+    for sname in sheet_names:
+        try:
+            file.seek(0)
+            df = pd.read_excel(file, sheet_name=sname, thousands=",")
+            df.columns = df.columns.str.strip()
+            df["_source_sheet"] = sname
+            frames.append(df)
+        except Exception as e:
+            logger.warning(f"Could not load sheet '{sname}': {e}")
+    if not frames:
+        raise ValueError("No data could be loaded from the selected sheets.")
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    return merged
 
 
 def _col(df: pd.DataFrame, col_map: dict, key: str) -> Optional[pd.Series]:
